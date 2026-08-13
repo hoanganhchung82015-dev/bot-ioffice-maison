@@ -6,25 +6,33 @@ import requests
 from playwright.async_api import async_playwright
 import google.generativeai as genai
 
+import os
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# Mở một Web Server nhẹ để Render duyệt gói Free không cần thẻ Visa
+# Handler phản hồi yêu cầu kiểm tra từ Render
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"Bot iOffice is running!")
+        self.wfile.write("Bot iOffice is running!".encode('utf-8'))
 
-def start_health_check_server():
-    # Render tự động cung cấp biến PORT, nếu không có sẽ mặc định dùng 8080
-    import os
+    # Tắt log các request thừa để nhẹ terminal
+    def log_message(self, format, *args):
+        return
+
+def run_health_check_server():
+    # Render tự động gán biến PORT (thường là 10000), nếu không có sẽ dùng 8080
     port = int(os.environ.get("PORT", 8080))
     server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    print(f"=== Web Server đang lắng nghe tại cổng {port} ===")
     server.serve_forever()
 
-# Chạy Server kiểm tra sức khỏe ở tiến trình ngầm
-threading.Thread(target=start_health_check_server, daemon=True).start()
+# Khởi chạy Web Server ở tiến trình ngầm (Daemon Thread)
+threading.Thread(target=run_health_check_server, daemon=True).start()
+
+# --- TOÀN BỘ CODE BOT CHÍNH CỦA BẠN GIỮ NGUYÊN BÊN DƯỚI ---
 
 # --- TOÀN BỘ CODE BOT CHÍNH CỦA BẠN GIỮ NGUYÊN BÊN DƯỚI ---
 
