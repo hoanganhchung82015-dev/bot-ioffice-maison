@@ -60,7 +60,7 @@ def analyze_with_gemini(doc_title):
             "y_kien_chi_dao": "Giao PHT chủ trì nghiên cứu, xây dựng kế hoạch triển khai thực hiện đúng quy định."
         }
 
-# --- 3. QUÉT VĂN BẢN TỪ IOFFICE ---
+# --- 3. QUÉT VĂN BẢN TỪ IOFFICE (ĐÃ SỬA LỖI TREO KHI KHÔNG CÓ VĂN BẢN) ---
 async def scan_ioffice_documents():
     global tasks_cache
     tasks_cache = []
@@ -70,57 +70,77 @@ async def scan_ioffice_documents():
         context = await browser.new_context()
         page = await context.new_page()
 
-        logging.info("Đang đăng nhập VNPT iOffice THPT Mai Sơn...")
-        await page.goto(IOFFICE_URL)
-        await page.fill("input[name='username']", USERNAME)
-        await page.fill("input[name='password']", PASSWORD)
-        await page.click("button[type='submit']")
-        await page.wait_for_load_state("networkidle")
+        try:
+            logging.info("Đang đăng nhập VNPT iOffice THPT Mai Sơn...")
+            await page.goto(IOFFICE_URL, timeout=30000)
+            await page.fill("input[name='username']", USERNAME)
+            await page.fill("input[name='password']", PASSWORD)
+            await page.click("button[type='submit']")
+            await page.wait_for_load_state("networkidle")
 
-        logging.info("Đang quét danh sách văn bản chờ xử lý...")
-        await page.goto(f"{IOFFICE_URL}/main/van-ban-den/cho-xu-ly")
-        await page.wait_for_selector("table")
-
-        rows = await page.query_selector_all("table tbody tr")
-        if not rows:
-            await browser.close()
-            return None, "Hiện không có văn bản mới nào cần xử lý."
-
-        report = "📩 *BÁO CÁO DỰ THẢO PHÂN CÔNG VĂN BẢN (THPT MAI SƠN)*\n\n"
-        count = 0
-
-        for row in rows[:5]: # Tối đa 5 văn bản mới nhất
-            count += 1
-            title_elem = await row.query_selector(".doc-title")
-            link_elem = await row.query_selector("a")
-
-            title = await title_elem.inner_text() if title_elem else "Văn bản đến"
-            doc_url = await link_elem.get_attribute("href") if link_elem else IOFFICE_URL
-
-            if not doc_url.startswith("http"):
-                doc_url = IOFFICE_URL + doc_url
-
-            # Gọi AI phân tích
-            analysis = analyze_with_gemini(title)
+            logging.info("Đang truy cập danh sách văn bản chờ xử lý...")
+            await page.goto(f"{IOFFICE_URL}/main/van-ban-den/cho-xu-ly", timeout=30000)
             
-            task_info = {
-                "doc_title": title,
-                "doc_url": doc_url,
-                "nguoi_chu_tri": analysis['nguoi_chu_tri'],
-                "y_kien_chi_dao": analysis['y_kien_chi_dao']
-            }
-            tasks_cache.append(task_info)
+            # Thêm timeout 5s kiểm tra xem có bảng văn bản không
+            try:
+                await page.wait_for_selector("table tbody tr", timeout=5000)
+            except Exception:
+                await browser.close()
+                return None, "📭 *Hiện tại không có văn bản mới nào cần xử lý!*"
 
-            report += f"*{count}. {title[:60]}...*\n"
-            report += f"👤 *Chủ trì:* `{analysis['nguoi_chu_tri']}`\n"
-            report += f"📌 *Phối hợp:* {analysis['bo_phan_phoi_hop']}\n"
-            report += f"🎯 *Sản phẩm:* {analysis['san_pham_dau_ra']}\n"
-            report += f"⏰ *Hạn:* `{analysis['han_hoan_thanh']}`\n"
-            report += f"📝 *Dự thảo chỉ đạo:* _{analysis['y_kien_chi_dao']}_\n"
-            report += "───────────────────\n"
+            rows = await page.query_selector_all("table tbody tr")
+            
+            # Kiểm tra nếu bảng trống
+            if not rows or len(rows) == 0:
+                await browser.close()
+                return None, "📭 *Hiện tại không có văn bản mới nào cần xử lý!*"
 
-        await browser.close()
-        return tasks_cache, report
+            # Kiểm tra nội dung dòng đầu tiên xem có phải thông báo "không có dữ liệu"
+            first_row_text = await rows[0].inner_text()
+            if "không có" in first_row_text.lower() or "no data" in first_row_text.lower():
+                await browser.close()
+                return None, "📭 *Hiện tại không có văn bản mới nào cần xử lý!*"
+
+            report = "📩 *BÁO CÁO DỰ THẢO PHÂN CÔNG VĂN BẢN (THPT MAI SƠN)*\n\n"
+            count = 0
+
+            for row in rows[:5]: # Tối đa 5 văn bản mới nhất
+                count += 1
+                title_elem = await row.query_selector(".doc-title")
+                link_elem = await row.query_selector("a")
+
+                title = await title_elem.inner_text() if title_elem else "Văn bản đến"
+                doc_url = await link_elem.get_attribute("href") if link_elem else IOFFICE_URL
+
+                if not doc_url.startswith("http"):
+                    doc_url = IOFFICE_URL + doc_url
+
+                # Gọi AI phân tích
+                analysis = analyze_with_gemini(title)
+                
+                task_info = {
+                    "doc_title": title,
+                    "doc_url": doc_url,
+                    "nguoi_chu_tri": analysis['nguoi_chu_tri'],
+                    "y_kien_chi_dao": analysis['y_kien_chi_dao']
+                }
+                tasks_cache.append(task_info)
+
+                report += f"*{count}. {title[:60]}...*\n"
+                report += f"👤 *Chủ trì:* `{analysis['nguoi_chu_tri']}`\n"
+                report += f"📌 *Phối hợp:* {analysis['bo_phan_phoi_hop']}\n"
+                report += f"🎯 *Sản phẩm:* {analysis['san_pham_dau_ra']}\n"
+                report += f"⏰ *Hạn:* `{analysis['han_hoan_thanh']}`\n"
+                report += f"📝 *Dự thảo chỉ đạo:* _{analysis['y_kien_chi_dao']}_\n"
+                report += "───────────────────\n"
+
+            await browser.close()
+            return tasks_cache, report
+
+        except Exception as e:
+            await browser.close()
+            logging.error(f"Lỗi truy cập iOffice: {e}")
+            return None, f"⚠️ *Không thể kết nối iOffice hoặc lỗi đăng nhập:* {str(e)}"
 
 # --- 4. TỰ ĐỘNG DÁN CHỈ ĐẠO LÊN IOFFICE ---
 async def apply_to_ioffice(tasks):
@@ -163,7 +183,7 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tasks, report = await scan_ioffice_documents()
 
     if not tasks:
-        await msg.edit_text(report)
+        await msg.edit_text(report, parse_mode="Markdown")
         return
 
     keyboard = [
