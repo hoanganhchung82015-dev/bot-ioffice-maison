@@ -1,21 +1,14 @@
-FROM python:3.10-slim
+FROM mcr.microsoft.com/playwright/python:v1.40.0-jammy
 
-# Thiết lập thư mục làm việc trong container
 WORKDIR /app
 
-# Thiết lập biến môi trường ngăn Python ghi file .pyc và bật unbuffered log
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-
-# Sao chép file khai báo thư viện và cài đặt
+# Cài đặt các thư viện Python
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+RUN playwright install-deps
 
-# Sao chép toàn bộ mã nguồn vào container
+# Copy toàn bộ code vào Docker Container
 COPY . .
 
-# Mở cổng 8080 mặc định
-EXPOSE 8080
-
-# Chạy ứng dụng
+# Lệnh khởi chạy chính
 CMD ["python", "main.py"]
