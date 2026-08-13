@@ -6,6 +6,28 @@ import requests
 from playwright.async_api import async_playwright
 import google.generativeai as genai
 
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# Mở một Web Server nhẹ để Render duyệt gói Free không cần thẻ Visa
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot iOffice is running!")
+
+def start_health_check_server():
+    # Render tự động cung cấp biến PORT, nếu không có sẽ mặc định dùng 8080
+    import os
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    server.serve_forever()
+
+# Chạy Server kiểm tra sức khỏe ở tiến trình ngầm
+threading.Thread(target=start_health_check_server, daemon=True).start()
+
+# --- TOÀN BỘ CODE BOT CHÍNH CỦA BẠN GIỮ NGUYÊN BÊN DƯỚI ---
+
 # --- 1. CẤU HÌNH BIẾN MÔI TRƯỜNG ---
 IOFFICE_URL = "https://thptmaison.vnptioffice.vn"
 USERNAME = os.environ.get("IOFFICE_USERNAME")
