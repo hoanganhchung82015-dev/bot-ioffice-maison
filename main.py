@@ -8,7 +8,7 @@ import google.generativeai as genai
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
-# Cấu hình log
+# Cấu hình logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- 1. BIẾN MÔI TRƯỜNG ---
@@ -19,10 +19,11 @@ GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("HIUTRUONG_CHAT_ID")
 
-# Cấu hình Gemini
-genai.configure(api_key=GEMINI_KEY)
+# Cấu hình Gemini API
+if GEMINI_KEY:
+    genai.configure(api_key=GEMINI_KEY)
 
-# Bộ nhớ tạm lưu văn bản chưa duyệt
+# Bộ nhớ tạm lưu văn bản chưa duyệt trong phiên làm việc
 tasks_cache = []
 
 # --- 2. PHÂN TÍCH VĂN BẢN BẰNG GEMINI 1.5 FLASH ---
@@ -36,7 +37,7 @@ def analyze_with_gemini(doc_title):
     - PHT CSVC: Cơ sở vật chất, lao động, an ninh trật tự, PCCC, phòng chống ma túy, các phong trào/ngoại khóa.
     - Hiệu trưởng: Công tác Đảng, tài chính, tổ chức cán bộ, các quy định pháp luật/chỉ đạo chung.
 
-    Hãy trả về đúng định dạng JSON (không có khối code markdown):
+    Hãy trả về đúng định dạng JSON (không dùng khối markdown ```json):
     {{
         "nguoi_chu_tri": "PHT Lại Thế Dũng" hoặc "PHT CSVC" hoặc "Hiệu trưởng",
         "bo_phan_phoi_hop": "Tổ chuyên môn / Đoàn TN / Kế toán / Bảo vệ...",
@@ -60,7 +61,7 @@ def analyze_with_gemini(doc_title):
             "y_kien_chi_dao": "Giao PHT chủ trì nghiên cứu, xây dựng kế hoạch triển khai thực hiện đúng quy định."
         }
 
-# --- 3. QUÉT VĂN BẢN TỪ IOFFICE (ĐÃ SỬA LỖI TREO KHI KHÔNG CÓ VĂN BẢN) ---
+# --- 3. QUÉT VĂN BẢN TỪ IOFFICE (TỐI ƯU KHÔNG BỊ TREO) ---
 async def scan_ioffice_documents():
     global tasks_cache
     tasks_cache = []
@@ -81,7 +82,7 @@ async def scan_ioffice_documents():
             logging.info("Đang truy cập danh sách văn bản chờ xử lý...")
             await page.goto(f"{IOFFICE_URL}/main/van-ban-den/cho-xu-ly", timeout=30000)
             
-            # Thêm timeout 5s kiểm tra xem có bảng văn bản không
+            # Đợi tối đa 5 giây xem bảng dữ liệu có xuất hiện không
             try:
                 await page.wait_for_selector("table tbody tr", timeout=5000)
             except Exception:
@@ -95,7 +96,7 @@ async def scan_ioffice_documents():
                 await browser.close()
                 return None, "📭 *Hiện tại không có văn bản mới nào cần xử lý!*"
 
-            # Kiểm tra nội dung dòng đầu tiên xem có phải thông báo "không có dữ liệu"
+            # Kiểm tra nếu dòng đầu tiên là thông báo không có dữ liệu
             first_row_text = await rows[0].inner_text()
             if "không có" in first_row_text.lower() or "no data" in first_row_text.lower():
                 await browser.close()
@@ -115,7 +116,7 @@ async def scan_ioffice_documents():
                 if not doc_url.startswith("http"):
                     doc_url = IOFFICE_URL + doc_url
 
-                # Gọi AI phân tích
+                # Gọi AI phân tích văn bản
                 analysis = analyze_with_gemini(title)
                 
                 task_info = {
@@ -176,22 +177,39 @@ async def apply_to_ioffice(tasks):
 
 # --- 5. LỆNH & XỬ LÝ NÚT BẤM TELEGRAM ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Chào Thầy! Gõ lệnh /scan để kiểm tra và lập dự thảo phân công văn bản iOffice mới nhất.")
+    user_id = str(update.effective_user.id)
+    logging.info(f"Người dùng gõ /start có Chat ID: {user_id}")
+    
+    await update.message.reply_text(
+        f"👋 *Chào mừng Thầy/Cô đến với Bot Trợ lý iOffice THPT Mai Sơn!*\n\n"
+        f"🆔 Chat ID Telegram của bạn là: `{user_id}`\n"
+        f"👉 Hãy đối chiếu đảm bảo dãy số trên đã được nhập chính xác vào biến HIUTRUONG_CHAT_ID trên Render.\n\n"
+        f"Gõ lệnh /scan để bắt đầu kiểm tra và lập dự thảo phân công văn bản iOffice.",
+        parse_mode="Markdown"
+    )
 
 async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("⏳ Đang kết nối iOffice THPT Mai Sơn và gọi Gemini phân tích văn bản...")
-    tasks, report = await scan_ioffice_documents()
+    
+    try:
+        # Giới hạn thời gian quét tối đa 25 giây để tránh đơ/treo bot
+        tasks, report = await asyncio.wait_for(scan_ioffice_documents(), timeout=25.0)
 
-    if not tasks:
-        await msg.edit_text(report, parse_mode="Markdown")
-        return
+        if not tasks:
+            await msg.edit_text(report, parse_mode="Markdown")
+            return
 
-    keyboard = [
-        [InlineKeyboardButton("🟢 ĐỒNG Ý PHÂN CÔNG TẤT CẢ", callback_data="approve_all")],
-        [InlineKeyboardButton("🔴 HỦY BỎ / TỰ XỬ LÝ", callback_data="cancel")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await msg.edit_text(report, parse_mode="Markdown", reply_markup=reply_markup)
+        keyboard = [
+            [InlineKeyboardButton("🟢 ĐỒNG Ý PHÂN CÔNG TẤT CẢ", callback_data="approve_all")],
+            [InlineKeyboardButton("🔴 HỦY BỎ / TỰ XỬ LÝ", callback_data="cancel")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await msg.edit_text(report, parse_mode="Markdown", reply_markup=reply_markup)
+
+    except asyncio.TimeoutError:
+        await msg.edit_text("⚠️ *Quá thời gian kết nối (Timeout)!* Hệ thống iOffice phản hồi quá chậm hoặc trang web đang bảo trì. Vui lòng thử lại sau.", parse_mode="Markdown")
+    except Exception as e:
+        await msg.edit_text(f"⚠️ *Lỗi phát sinh:* {str(e)}", parse_mode="Markdown")
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -210,6 +228,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- 6. CHẠY WEB SERVICE LÂU DÀI ---
 def main():
+    if not BOT_TOKEN:
+        logging.error("Chưa cấu hình TELEGRAM_BOT_TOKEN!")
+        return
+
     application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start_command))
