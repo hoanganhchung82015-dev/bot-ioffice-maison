@@ -1,6 +1,22 @@
+# Python bytecode & cache
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+
+# Environment variables & local secrets
 .env
-.venv/
+.env.local
+
+# Virtual environments
 venv/
-*.log
+env/
+ENV/
+
+# IDE & Editor configs
+.vscode/
+.idea/
+*.swp
+
+# OS generated files
+.DS_Store
+Thumbs.db
