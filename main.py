@@ -5,14 +5,14 @@ import logging
 import threading
 from flask import Flask
 from playwright.async_api import async_playwright
-from google import genai
+import google.genai as genai
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # Cấu hình logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- 0. KHỞI TẠO FLASK SERVER CHO RENDER HEALTH CHECK ---
+# --- 0. KHỞI TẠO FLASK SERVER PHỤC VỤ RENDER HEALTH CHECK ---
 app = Flask(__name__)
 
 @app.route('/')
@@ -22,7 +22,7 @@ def health_check():
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
-    # Chạy Flask ở luồng phụ, tắt reloader để không xung đột
+    logging.info(f"Đang khởi chạy Flask Web Server tại port {port}...")
     app.run(host='0.0.0.0', port=port, use_reloader=False)
 
 # --- 1. BIẾN MÔI TRƯỜNG ---
@@ -32,7 +32,7 @@ PASSWORD = os.environ.get("IOFFICE_PASSWORD")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 
-# Khởi tạo Gemini Client mới
+# Khởi tạo Gemini Client
 ai_client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
 
 # --- 2. PHÂN TÍCH VĂN BẢN BẰNG GEMINI 1.5 FLASH ---
@@ -281,20 +281,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- 6. KHỞI CHẠY MAIN ---
 if __name__ == "__main__":
-    # 1. Chạy Flask ở luồng ngầm (Background Thread)
+    # 1. Chạy Flask ở Luồng phụ (Background Thread) để xử lý Health Check của Render
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
-    logging.info("Flask server đã chạy ngầm để phục vụ Health Check Render.")
+    logging.info("Flask server đã khởi động ngầm thành công.")
 
     # 2. Chạy Telegram Bot ở Luồng chính (Main Thread)
     if not BOT_TOKEN:
-        logging.error("Chưa cấu hình TELEGRAM_BOT_TOKEN!")
+        logging.error("Chưa cấu hình TELEGRAM_BOT_TOKEN trong biến môi trường!")
     else:
-        logging.info("Đang khởi động Telegram Bot ở luồng chính...")
+        logging.info("Đang khởi động Telegram Bot ở Luồng chính...")
         application = Application.builder().token(BOT_TOKEN).build()
         application.add_handler(CommandHandler("start", start_command))
         application.add_handler(CommandHandler("scan", scan_command))
         application.add_handler(CallbackQueryHandler(handle_callback))
         
-        # Hàm run_polling chạy ở Main Thread sẽ đăng ký Signal thành công không còn lỗi
+        # Chạy Polling ở Luồng chính
         application.run_polling(drop_pending_updates=True)
