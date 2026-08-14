@@ -12,19 +12,13 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 # Cấu hình logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- 0. TẠO FLASK WEB SERVER ĐỂ GIỮ RENDER HEALTH CHECK ACTIVE ---
-web_app = Flask(__name__)
+# --- 0. KHỞI TẠO FLASK SERVER CHO GUNICORN/RENDER ---
+app = Flask(__name__)
 
-@web_app.route('/')
-@web_app.route('/health')
+@app.route('/')
+@app.route('/health')
 def health_check():
-    return "Bot iOffice THPT Mai Son is running successfully!", 200
-
-def run_flask():
-    # Render tự động gán cổng qua biến môi trường PORT (mặc định 10000)
-    port = int(os.environ.get("PORT", 10000))
-    logging.info(f"Đang khởi chạy Flask Web Server tại port {port}...")
-    web_app.run(host='0.0.0.0', port=port)
+    return "Bot iOffice THPT Mai Son is running alive!", 200
 
 # --- 1. BIẾN MÔI TRƯỜNG ---
 IOFFICE_URL = os.environ.get("IOFFICE_URL", "https://thptmaison.vnptioffice.vn")
@@ -214,12 +208,9 @@ async def apply_to_ioffice(tasks):
 # --- 5. LỆNH & XỬ LÝ NÚT BẤM TELEGRAM ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    logging.info(f"Người dùng gõ /start có Chat ID: {user_id}")
-    
     await update.message.reply_text(
         f"👋 *Chào mừng Thầy/Cô đến với Bot Trợ lý iOffice THPT Mai Sơn!*\n\n"
-        f"🆔 Chat ID Telegram của bạn là: `{user_id}`\n"
-        f"👉 Hãy đối chiếu đảm bảo dãy số trên đã được nhập chính xác vào biến HIUTRUONG_CHAT_ID trên Render.\n\n"
+        f"🆔 Chat ID Telegram của bạn là: `{user_id}`\n\n"
         f"Gõ lệnh /scan để bắt đầu kiểm tra và lập dự thảo phân công văn bản iOffice.",
         parse_mode="Markdown"
     )
@@ -244,7 +235,7 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(report, parse_mode="Markdown", reply_markup=reply_markup)
 
     except asyncio.TimeoutError:
-        await msg.edit_text("⚠️ *Quá thời gian kết nối (Timeout)!* Hệ thống iOffice phản hồi quá chậm hoặc trang web đang bảo trì. Vui lòng thử lại sau.", parse_mode="Markdown")
+        await msg.edit_text("⚠️ *Quá thời gian kết nối (Timeout)!* Hệ thống iOffice phản hồi quá chậm.", parse_mode="Markdown")
     except Exception as e:
         await msg.edit_text(f"⚠️ *Lỗi phát sinh:* {str(e)}", parse_mode="Markdown")
 
@@ -254,50 +245,52 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == "approve_all":
         tasks = context.user_data.get('pending_tasks', [])
-        
         if not tasks:
-            await query.edit_message_text("⚠️ *Dữ liệu phiên làm việc đã hết hạn.* Vui lòng gõ lại lệnh /scan để lấy danh sách mới.", parse_mode="Markdown")
+            await query.edit_message_text("⚠️ *Dữ liệu đã hết hạn.* Hãy gõ /scan để lấy danh sách mới.", parse_mode="Markdown")
             return
 
-        await query.edit_message_text("⏳ *Đang tiến hành tự động dán chỉ đạo và chuyển văn bản trên VNPT iOffice...*", parse_mode="Markdown")
+        await query.edit_message_text("⏳ *Đang tự động dán chỉ đạo lên iOffice...*", parse_mode="Markdown")
         
         success, err = await apply_to_ioffice(tasks)
         if success:
             context.user_data['pending_tasks'] = []
             await context.bot.send_message(
                 chat_id=query.message.chat_id,
-                text="✅ *HOÀN THÀNH 100%!*\nToàn bộ văn bản đã được phân công thành công trên iOffice.",
+                text="✅ *HOÀN THÀNH 100%!* Đã phân công thành công trên iOffice.",
                 parse_mode="Markdown"
             )
         else:
             await context.bot.send_message(
                 chat_id=query.message.chat_id,
-                text=f"❌ *Có lỗi khi chuyển văn bản trên iOffice:* {str(err)}",
+                text=f"❌ *Có lỗi khi chuyển văn bản:* {str(err)}",
                 parse_mode="Markdown"
             )
 
     elif query.data == "cancel":
         context.user_data['pending_tasks'] = []
-        await query.edit_message_text("❌ *Đã hủy lệnh tự động.* Thầy có thể phân công trực tiếp trên web iOffice.")
+        await query.edit_message_text("❌ *Đã hủy lệnh tự động.*")
 
-# --- 6. KHỞI CHẠY KHÓA SONG SONG (FLASK + TELEGRAM BOT) ---
-def main():
+# --- 6. KHỞI CHẠY BOT TRONG LUỒNG PHỤ (BACKGROUND THREAD) ---
+def run_telegram_bot():
     if not BOT_TOKEN:
         logging.error("Chưa cấu hình TELEGRAM_BOT_TOKEN!")
         return
 
-    # Chạy Flask ở luồng riêng để trả lời yêu cầu Port từ Render
-    threading.Thread(target=run_flask, daemon=True).start()
+    # Khởi tạo event loop riêng cho luồng Telegram Bot
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
 
-    # Chạy Bot Telegram ở luồng chính
     application = Application.builder().token(BOT_TOKEN).build()
-
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("scan", scan_command))
     application.add_handler(CallbackQueryHandler(handle_callback))
 
-    logging.info("Bot Web Service đã sẵn sàng và đang lắng nghe lệnh trên Telegram...")
-    application.run_polling()
+    logging.info("Bot Telegram đang bắt đầu Polling...")
+    application.run_polling(drop_pending_updates=True)
+
+# Bật luồng chạy Telegram Bot ngay khi file được import bởi Gunicorn
+threading.Thread(target=run_telegram_bot, daemon=True).start()
 
 if __name__ == "__main__":
-    main()
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
