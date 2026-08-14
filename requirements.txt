@@ -1,6 +1,5 @@
-python-telegram-bot
-google-generativeai
-playwright
 flask
+playwright
+python-telegram-bot
+google-genai
 gunicorn
-requests
