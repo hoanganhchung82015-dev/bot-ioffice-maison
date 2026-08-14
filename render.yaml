@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: ioffice-bot
+    env: python
+    buildCommand: pip install -r requirements.txt && playwright install --with-deps chromium
+    startCommand: gunicorn main:app
