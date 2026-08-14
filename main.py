@@ -2,6 +2,7 @@ import os
 import logging
 import asyncio
 from typing import List, Dict, Any
+from urllib.parse import urljoin
 from aiohttp import web
 from playwright.async_api import async_playwright
 import google.generativeai as genai
@@ -17,17 +18,37 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Lấy các biến môi trường từ Render
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-IOFFICE_URL = os.getenv("IOFFICE_URL", "https://thptmaison.vnptioffice.vn").strip()
+
+# Chuẩn hóa URL gốc chuẩn xác
+BASE_URL = os.getenv("IOFFICE_URL", "https://thptmaison.vnptioffice.vn").strip()
+if not BASE_URL.startswith(("http://", "https://")):
+    BASE_URL = f"https://{BASE_URL}"
+BASE_URL = BASE_URL.rstrip('/')
+
 IOFFICE_USERNAME = os.getenv("IOFFICE_USERNAME", "").strip()
 IOFFICE_PASSWORD = os.getenv("IOFFICE_PASSWORD", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 PORT = int(os.getenv("PORT", 10000))
 
-# Cấu hình Gemini API
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
+
+def make_absolute_url(raw_url: str) -> str:
+    """Chuyển đổi mọi đường dẫn tương đối/tùy biến thành URL tuyệt đối an toàn cho Playwright."""
+    if not raw_url or not isinstance(raw_url, str):
+        return BASE_URL
+    
+    clean_url = raw_url.strip()
+    if clean_url.lower().startswith("javascript:") or clean_url == "#" or not clean_url:
+        return BASE_URL
+    
+    # Nếu đã là HTTP/HTTPS chuẩn
+    if clean_url.startswith(("http://", "https://")):
+        return clean_url
+    
+    # Nối đường dẫn tương đối với BASE_URL
+    return urljoin(BASE_URL + "/", clean_url.lstrip('/'))
 
 # ==========================================
 # 2. HÀM XỬ LÝ PLAYWRIGHT & CÀO VĂN BẢN
@@ -36,10 +57,8 @@ async def scan_ioffice_documents() -> List[Dict[str, Any]]:
     """Tự động đăng nhập iOffice và lấy danh sách văn bản chờ duyệt/phân công."""
     documents = []
     
-    # Kiểm tra biến môi trường cơ bản
-    if not IOFFICE_URL or not IOFFICE_URL.startswith(("http://", "https://")):
-        logger.error(f"IOFFICE_URL không hợp lệ: '{IOFFICE_URL}'")
-        return []
+    target_url = make_absolute_url(BASE_URL)
+    logger.info(f"Đang chuẩn bị kết nối tới iOffice gốc: {target_url}")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -50,28 +69,30 @@ async def scan_ioffice_documents() -> List[Dict[str, Any]]:
         page = await context.new_page()
 
         try:
-            logger.info(f"Đang kết nối tới iOffice: {IOFFICE_URL}")
-            await page.goto(IOFFICE_URL, timeout=60000, wait_until="networkidle")
+            logger.info(f"Đang mở trang chủ iOffice: {target_url}")
+            await page.goto(target_url, timeout=60000, wait_until="networkidle")
 
             # --- THỰC HIỆN ĐĂNG NHẬP ---
-            # Thầy có thể điều chỉnh Selector cho đúng với giao diện VNPT iOffice
             username_selector = "input[name='username'], input[id='username'], input[type='text']"
             password_selector = "input[name='password'], input[id='password'], input[type='password']"
             submit_selector = "button[type='submit'], input[type='submit'], .btn-login"
 
             if await page.is_visible(username_selector):
-                logger.info("Đang đăng nhập iOffice...")
+                logger.info("Đang điền thông tin đăng nhập VNPT iOffice THPT Mai Sơn...")
                 await page.fill(username_selector, IOFFICE_USERNAME)
                 await page.fill(password_selector, IOFFICE_PASSWORD)
                 await page.click(submit_selector)
                 await page.wait_for_load_state("networkidle")
 
+            # Sau khi đăng nhập, kiểm tra URL hiện tại xem có bị chuyển hướng lỗi không
+            current_url = page.url
+            logger.info(f"URL sau khi đăng nhập thành công: {current_url}")
+
             # --- TRUY CẬP MỤC VĂN BẢN CHỜ DUYỆT / XỬ LÝ ---
-            # Tìm danh sách dòng chứa văn bản (Cần điều chỉnh CSS Selector phù hợp với giao diện thực tế)
-            rows = await page.query_selector_all("table.table-v2 tbody tr, .list-doc-item")
+            rows = await page.query_selector_all("table.table-v2 tbody tr, .list-doc-item, tr")
             logger.info(f"Tìm thấy {len(rows)} hàng dữ liệu.")
 
-            for index, row in enumerate(rows[:5]): # Lấy tối đa 5 văn bản mới nhất
+            for index, row in enumerate(rows[:5]):
                 try:
                     title_elem = await row.query_selector("td.title, a.doc-title, td:nth-child(2)")
                     link_elem = await row.query_selector("a[href]")
@@ -79,17 +100,9 @@ async def scan_ioffice_documents() -> List[Dict[str, Any]]:
                     title = await title_elem.inner_text() if title_elem else f"Văn bản {index+1}"
                     title = title.strip()
 
-                    # --- CHUẨN HÓA URL (TRÁNH LỖI INVALID URL) ---
+                    # Lấy href và bọc lót tuyệt đối
                     raw_href = await link_elem.get_attribute("href") if link_elem else None
-                    doc_url = IOFFICE_URL # Mặc định gán về trang chủ nếu không lấy được URL con
-
-                    if raw_href and raw_href.strip() and not "javascript" in raw_href.lower():
-                        if raw_href.startswith("http://") or raw_href.startswith("https://"):
-                            doc_url = raw_href.strip()
-                        else:
-                            base_url = IOFFICE_URL.rstrip('/')
-                            path = raw_href.lstrip('/')
-                            doc_url = f"{base_url}/{path}"
+                    doc_url = make_absolute_url(raw_href)
 
                     documents.append({
                         "id": index + 1,
@@ -101,7 +114,8 @@ async def scan_ioffice_documents() -> List[Dict[str, Any]]:
                     continue
 
         except Exception as e:
-            logger.error(f"Lỗi khi thao tác trên Playwright: {e}")
+            logger.error(f"Lỗi truy cập iOffice: {e}")
+            raise e
         finally:
             await browser.close()
 
@@ -122,9 +136,9 @@ async def analyze_and_assign_with_gemini(doc_title: str) -> str:
     📄 **Tên văn bản**: "{doc_title}"
 
     Nhiệm vụ của bạn:
-    1. Tóm tắt ngắn gọn mục đích chính của văn bản này (khoảng 1-2 câu).
-    2. Đề xuất phân công nhiệm vụ cho các bộ phận/cá nhân trong nhà trường (Ví dụ: BGH, Tổ chuyên môn, Đoàn thanh niên, Giáo viên chủ nhiệm, Kế toán, v.v.).
-    3. Trình bày ngắn gọn, rõ ràng bằng Tiếng Việt dưới dạng biểu tượng đầu dòng, phù hợp để gửi nhanh qua Telegram.
+    1. Tóm tắt ngắn gọn mục đích chính của văn bản này (1-2 câu).
+    2. Đề xuất phân công nhiệm vụ cụ thể cho các bộ phận/cá nhân trong nhà trường (Ví dụ: BGH, Tổ chuyên môn, Đoàn thanh niên, GVCN, Kế toán, v.v.).
+    3. Trình bày ngắn gọn, rõ ràng bằng Tiếng Việt với biểu tượng đầu dòng, phù hợp để gửi qua Telegram.
     """
     try:
         model = genai.GenerativeModel('gemini-2.5-flash')
@@ -150,32 +164,36 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Xử lý lệnh /scan"""
     status_msg = await update.message.reply_text("🔍 **Đang kết nối iOffice để kiểm tra văn bản...** Vui lòng đợi trong giây lát.")
 
-    docs = await scan_ioffice_documents()
+    try:
+        docs = await scan_ioffice_documents()
 
-    if not docs:
-        await status_msg.edit_text("ℹ️ **Không tìm thấy văn bản mới** hoặc hệ thống không thể đăng nhập vào iOffice. Vui lòng kiểm tra lại cấu hình log!")
-        return
+        if not docs:
+            await status_msg.edit_text("ℹ️ **Không tìm thấy văn bản mới** hoặc hệ thống iOffice không có dữ liệu trả về.")
+            return
 
-    await status_msg.edit_text(f"✅ Tìm thấy **{len(docs)}** văn bản. Đang phân tích và lập dự thảo phân công nhiệm vụ bằng Gemini AI...")
+        await status_msg.edit_text(f"✅ Tìm thấy **{len(docs)}** văn bản. Đang phân tích và lập dự thảo phân công nhiệm vụ...")
 
-    for doc in docs:
-        # Nhờ Gemini dự thảo phân công
-        ai_suggestion = await analyze_and_assign_with_gemini(doc['title'])
+        for doc in docs:
+            ai_suggestion = await analyze_and_assign_with_gemini(doc['title'])
 
-        response_text = (
-            f"📌 **VĂN BẢN #{doc['id']}**\n"
-            f"📄 **Tên văn bản**: [{doc['title']}]({doc['url']})\n\n"
-            f"🤖 **DỰ THẢO PHÂN CÔNG CHI TIẾT (GEMINI AI):**\n"
-            f"{ai_suggestion}\n\n"
-            f"🔗 [Mở văn bản trên iOffice]({doc['url']})"
-        )
-        await update.message.reply_text(response_text, parse_mode="Markdown", disable_web_page_preview=True)
+            response_text = (
+                f"📌 **VĂN BẢN #{doc['id']}**\n"
+                f"📄 **Tên văn bản**: [{doc['title']}]({doc['url']})\n\n"
+                f"🤖 **DỰ THẢO PHÂN CÔNG CHI TIẾT (GEMINI AI):**\n"
+                f"{ai_suggestion}\n\n"
+                f"🔗 [Mở văn bản trên iOffice]({doc['url']})"
+            )
+            await update.message.reply_text(response_text, parse_mode="Markdown", disable_web_page_preview=True)
+
+    except Exception as err:
+        logger.error(f"Lỗi quét iOffice: {err}")
+        await status_msg.edit_text(f"❌ **Không thể quét iOffice**: `{err}`", parse_mode="Markdown")
 
 # ==========================================
 # 5. DỊCH VỤ WEB DUMMY (KEEP-ALIVE CHO RENDER)
 # ==========================================
 async def handle_ping(request):
-    """Đảm bảo Render luôn nhận thấy Port lắng nghe HTTP thành công."""
+    """Giúp Render nhận diện Port HTTP active thành công."""
     return web.Response(text="iOffice Telegram Bot is running perfectly!")
 
 async def start_web_server():
@@ -196,23 +214,18 @@ async def main():
         logger.error("Chưa thiết lập TELEGRAM_BOT_TOKEN trong Environment!")
         return
 
-    # 1. Khởi tạo Telegram Bot Application
     telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # 2. Đăng ký các câu lệnh handler
     telegram_app.add_handler(CommandHandler("start", start_command))
     telegram_app.add_handler(CommandHandler("scan", scan_command))
 
-    # 3. Chạy HTTP dummy web server song song
     await start_web_server()
 
-    # 4. Khởi chạy Telegram Bot Polling an toàn
     logger.info("Khởi động Telegram Bot...")
     await telegram_app.initialize()
     await telegram_app.start()
     await telegram_app.updater.start_polling(drop_pending_updates=True)
 
-    # Giữ ứng dụng luôn luôn chạy
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
