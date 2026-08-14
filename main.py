@@ -50,26 +50,25 @@ if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
 # ==========================================
-# 2. XỬ LÝ ĐỌC FILE PDF TỪ BYTES
+# 2. XỬ LÝ ĐỌC FILE PDF
 # ==========================================
 def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
-    """Đọc và trích xuất chữ từ file PDF trong bộ nhớ."""
+    """Trích xuất toàn bộ văn bản từ file PDF."""
     try:
         reader = PdfReader(BytesIO(pdf_bytes))
         full_text = []
-        # Lấy tối đa 8 trang đầu (nơi chứa trích yếu, nội dung chỉ đạo, hạn hoàn thành)
-        max_pages = min(len(reader.pages), 8)
+        max_pages = min(len(reader.pages), 10)
         for i in range(max_pages):
             text = reader.pages[i].extract_text()
             if text:
                 full_text.append(text)
         return "\n".join(full_text)
     except Exception as e:
-        logger.error(f"Lỗi trích xuất PDF: {e}")
+        logger.error(f"Lỗi đọc PDF bytes: {e}")
         return ""
 
 # ==========================================
-# 3. TẠO FILE WORD CHUẨN BÁO CÁO BGH
+# 3. TẠO FILE WORD BÁO CÁO KẺ BẢNG
 # ==========================================
 def set_cell_background(cell, fill_hex):
     """Tô màu nền cho ô trong bảng Word."""
@@ -77,7 +76,7 @@ def set_cell_background(cell, fill_hex):
     cell._tc.get_or_add_tcPr().append(shading_elm)
 
 def create_docx_report(data_list: List[Dict[str, Any]]) -> BytesIO:
-    """Tạo file Word chứa bảng tổng hợp phân công văn bản đến."""
+    """Tạo file Word chứa bảng tổng hợp phân công xử lý văn bản đến."""
     doc = Document()
 
     for section in doc.sections:
@@ -153,10 +152,10 @@ def create_docx_report(data_list: List[Dict[str, Any]]) -> BytesIO:
     return target_stream
 
 # ==========================================
-# 4. QUÉT IOFFICE VÀ ĐỌC SÂU PDF
+# 4. BOT SCAN IOFFICE & TRÍCH XUẤT FULL
 # ==========================================
 async def scan_and_process_ioffice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status_msg = await update.message.reply_text("🔍 **Đang khởi động Playwright & kết nối iOffice...**", parse_mode="Markdown")
+    status_msg = await update.message.reply_text("🔍 **Đang kết nối tới hệ thống VNPT iOffice...**", parse_mode="Markdown")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -179,16 +178,14 @@ async def scan_and_process_ioffice(update: Update, context: ContextTypes.DEFAULT
                 await page.click(submit_sel)
                 await page.wait_for_load_state("networkidle")
 
-            # --- 2. VÀO MENU "Văn bản đến" -> "Duyệt văn bản đến" ---
-            await status_msg.edit_text("📂 **Đang di chuyển tới mục 'Duyệt văn bản đến'...**", parse_mode="Markdown")
+            # --- 2. ĐẾN MỤC DUYỆT VĂN BẢN ĐẾN ---
+            await status_msg.edit_text("📂 **Mở giao diện Duyệt Văn bản đến...**", parse_mode="Markdown")
             
-            # Click Menu cha
             vb_den_menu = page.locator("a:has-text('Văn bản đến'), span:has-text('Văn bản đến')").first
             if await vb_den_menu.is_visible():
                 await vb_den_menu.click()
                 await page.wait_for_timeout(1000)
 
-            # Click Menu con
             duyet_vb_menu = page.locator("a:has-text('Duyệt văn bản đến'), span:has-text('Duyệt văn bản đến')").first
             if await duyet_vb_menu.is_visible():
                 await duyet_vb_menu.click()
@@ -196,121 +193,112 @@ async def scan_and_process_ioffice(update: Update, context: ContextTypes.DEFAULT
 
             await page.wait_for_timeout(3000)
 
-            # --- 3. BẮT ĐÚNG BẢNG "VB CHỜ DUYỆT" ---
-            # Selector chính xác tránh bắt nhầm menu
-            row_selectors = [
-                ".tab-content .active table tbody tr",
-                "#gridDuyetVBDen table tbody tr",
-                "table.table-hover tbody tr",
-                "table tbody tr"
-            ]
+            # --- 3. BƯỚC CỐT LÕI: LẤY SẠCH DANH SÁCH HÀNG (TRÁNH BỊ MẤT VÒNG LẶP) ---
+            rows = await page.query_selector_all("table tbody tr")
+            doc_items = []
 
-            rows = []
-            for sel in row_selectors:
-                found = await page.query_selector_all(sel)
-                if len(found) > 0:
-                    rows = found
-                    break
-
-            valid_rows = []
             for r in rows:
-                text = (await r.inner_text()).strip()
-                # Lọc chỉ lấy các hàng có chứa STT là số hoặc có Trích yếu thật
-                if re.search(r'^\d+', text) or "v/v" in text.lower() or "báo cáo" in text.lower() or "thông tư" in text.lower() or "quyết định" in text.lower():
-                    valid_rows.append(r)
+                link_elem = await r.query_selector("td a, a.doc-title, td:nth-child(4) a, td:nth-child(3) a")
+                if link_elem:
+                    title_text = (await link_elem.inner_text()).strip().replace("\n", " ")
+                    href = await link_elem.get_attribute("href") or ""
+                    # Bỏ qua các hàng tiêu đề/menu không phải văn bản
+                    if len(title_text) > 8 and not any(k in title_text.lower() for k in ["trích yếu", "toggle navigation", "vb đến"]):
+                        doc_items.append({
+                            "title": title_text,
+                            "href": href,
+                            "element": link_elem
+                        })
 
-            total_docs = len(valid_rows)
+            total_docs = len(doc_items)
             if total_docs == 0:
-                await status_msg.edit_text("ℹ️ **Không tìm thấy văn bản nào trong danh sách cần duyệt.**", parse_mode="Markdown")
+                await status_msg.edit_text("ℹ️ **Không tìm thấy văn bản nào cần duyệt.**", parse_mode="Markdown")
                 await browser.close()
                 return
 
-            await status_msg.edit_text(f"✅ Phát hiện **{total_docs}** văn bản đến. Bắt đầu tải PDF & phân tích...", parse_mode="Markdown")
+            await status_msg.edit_text(f"✅ Tìm thấy **{total_docs}** văn bản. Bắt đầu đọc PDF và phân công...", parse_mode="Markdown")
 
             parsed_results = []
 
-            for idx in range(total_docs):
+            # --- 4. DUYỆT CHI TIẾT TỪNG VĂN BẢN ---
+            for idx, item in enumerate(doc_items):
                 try:
-                    # Refresh selector tránh stale element
-                    for sel in row_selectors:
-                        current = await page.query_selector_all(sel)
-                        if len(current) >= total_docs:
-                            rows = current
-                            break
-
-                    row = valid_rows[idx] if idx < len(valid_rows) else rows[idx]
-                    
-                    # Lấy thẻ Link chứa trích yếu
-                    link_elem = await row.query_selector("td a, a.doc-title, td:nth-child(4) a, td:nth-child(3) a")
-                    if not link_elem:
-                        continue
-
-                    trich_yeu = (await link_elem.inner_text()).strip().replace("\n", " ")
-                    if len(trich_yeu) < 5 or "trích yếu" in trich_yeu.lower():
-                        continue
-
-                    await status_msg.edit_text(f"⏳ **[{idx+1}/{total_docs}]** Đang đọc PDF văn bản:\n📄 _{trich_yeu[:70]}..._", parse_mode="Markdown")
+                    trich_yeu = item["title"]
+                    await status_msg.edit_text(
+                        f"⏳ **[{idx+1}/{total_docs}]** Đang đọc PDF văn bản:\n📄 _{trich_yeu[:70]}..._",
+                        parse_mode="Markdown"
+                    )
 
                     pdf_text_content = ""
-                    
-                    # Thử bắt sự kiện Download file PDF hoặc mở tab xem chi tiết
-                    try:
-                        async with page.expect_download(timeout=5000) as download_info:
-                            await link_elem.click()
-                        download = await download_info.value
-                        download_path = await download.path()
-                        with open(download_path, "rb") as f:
-                            pdf_bytes = f.read()
-                        pdf_text_content = extract_text_from_pdf_bytes(pdf_bytes)
-                    except Exception:
-                        # Nếu không tự download mà mở trang chi tiết
-                        await page.wait_for_timeout(2000)
-                        
-                        # Tìm nút/link tải file đính kèm trong trang chi tiết
-                        pdf_link = await page.query_selector("a[href*='.pdf'], a:has-text('.pdf'), .file-attach a")
-                        if pdf_link:
-                            try:
-                                async with page.expect_download(timeout=5000) as download_info2:
-                                    await pdf_link.click()
-                                download2 = await download_info2.value
-                                path2 = await download2.path()
-                                with open(path2, "rb") as f:
-                                    pdf_bytes = f.read()
-                                pdf_text_content = extract_text_from_pdf_bytes(pdf_bytes)
-                            except Exception as dl_err:
-                                logger.warning(f"Không tải được file đính kèm: {dl_err}")
 
-                        # Nếu không tải được file, lấy toàn bộ chữ trên màn hình chi tiết
-                        if not pdf_text_content:
-                            body_elem = await page.query_selector(".doc-detail-content, .panel-body, #content-detail, body")
-                            if body_elem:
-                                pdf_text_content = await body_elem.inner_text()
+                    # Re-query lại để tránh stale element
+                    current_rows = await page.query_selector_all("table tbody tr")
+                    target_link = None
+                    for cr in current_rows:
+                        txt = (await cr.inner_text()).strip()
+                        if trich_yeu[:20] in txt:
+                            target_link = await cr.query_selector("td a, a.doc-title, td:nth-child(4) a, td:nth-child(3) a")
+                            break
 
-                        # Quay lại danh sách
-                        back_btn = page.locator("button:has-text('Quay lại'), a:has-text('Quay lại')").first
-                        if await back_btn.is_visible():
-                            await back_btn.click()
-                        else:
-                            await page.go_back()
-                        await page.wait_for_timeout(1500)
+                    if target_link:
+                        # Thử tải file PDF đính kèm
+                        try:
+                            async with page.expect_download(timeout=4000) as download_info:
+                                await target_link.click()
+                            download = await download_info.value
+                            path = await download.path()
+                            with open(path, "rb") as f:
+                                pdf_bytes = f.read()
+                            pdf_text_content = extract_text_from_pdf_bytes(pdf_bytes)
+                        except Exception:
+                            # Nếu click không tự tải về, đợi trang chi tiết mở ra
+                            await page.wait_for_timeout(2000)
+                            
+                            # Tìm nút PDF trong trang chi tiết
+                            pdf_btn = await page.query_selector("a[href*='.pdf'], a:has-text('.pdf'), iframe[src*='.pdf']")
+                            if pdf_btn:
+                                try:
+                                    async with page.expect_download(timeout=4000) as download_info2:
+                                        await pdf_btn.click()
+                                    download2 = await download_info2.value
+                                    path2 = await download2.path()
+                                    with open(path2, "rb") as f:
+                                        pdf_bytes2 = f.read()
+                                    pdf_text_content = extract_text_from_pdf_bytes(pdf_bytes2)
+                                except Exception:
+                                    pass
 
-                    # Phân tích sâu nội dung bằng Gemini 2.5 Flash
+                            # Nếu vẫn chưa tải được file, lấy toàn bộ văn bản màn hình
+                            if not pdf_text_content:
+                                body_elem = await page.query_selector(".doc-detail-content, .panel-body, #content-detail, body")
+                                if body_elem:
+                                    pdf_text_content = await body_elem.inner_text()
+
+                            # Quay lại danh sách
+                            back_btn = page.locator("button:has-text('Quay lại'), a:has-text('Quay lại')").first
+                            if await back_btn.is_visible():
+                                await back_btn.click()
+                            else:
+                                await page.go_back()
+                            await page.wait_for_timeout(1500)
+
+                    # Phân tích AI sâu bằng Gemini 2.5 Flash
                     ai_dict = await analyze_document_with_gemini(trich_yeu, pdf_text_content)
                     ai_dict["stt"] = len(parsed_results) + 1
                     ai_dict["title"] = trich_yeu
                     parsed_results.append(ai_dict)
 
                 except Exception as row_err:
-                    logger.error(f"Lỗi xử lý hàng {idx}: {row_err}")
+                    logger.error(f"Lỗi xử lý văn bản {idx+1}: {row_err}")
                     continue
 
-            # --- 5. XUẤT VÀ GỬI FILE WORD ---
+            # --- 5. TẠO FILE WORD & GỬI TỚI TELEGRAM ---
             if not parsed_results:
                 await status_msg.edit_text("❌ **Không trích xuất được dữ liệu văn bản nào.**", parse_mode="Markdown")
                 await browser.close()
                 return
 
-            await status_msg.edit_text("📝 **Đang hoàn thiện file Word báo cáo kẻ bảng...**", parse_mode="Markdown")
+            await status_msg.edit_text("📝 **Đang đóng gói file Word báo cáo...**", parse_mode="Markdown")
             
             docx_file = create_docx_report(parsed_results)
             filename = f"Bao_Cao_Phan_Cong_iOffice_{datetime.now().strftime('%Y%m%d_%H%M')}.docx"
@@ -319,53 +307,62 @@ async def scan_and_process_ioffice(update: Update, context: ContextTypes.DEFAULT
                 chat_id=update.effective_chat.id,
                 document=docx_file,
                 filename=filename,
-                caption=f"🎉 **Đã hoàn thành!** Gửi BGH file báo cáo phân công chi tiết cho **{len(parsed_results)}** văn bản đến."
+                caption=f"🎉 **Đã hoàn thành!** Đã đọc PDF & lập báo cáo phân công cho toàn bộ **{len(parsed_results)}** văn bản đến."
             )
             await status_msg.delete()
 
         except Exception as e:
-            logger.error(f"Lỗi quy trình scan: {e}")
-            await status_msg.edit_text(f"❌ **Lỗi trong quá trình quét**: `{e}`", parse_mode="Markdown")
+            logger.error(f"Lỗi quy trình: {e}")
+            await status_msg.edit_text(f"❌ **Lỗi trong quá trình cào dữ liệu**: `{e}`", parse_mode="Markdown")
         finally:
             await browser.close()
 
 # ==========================================
-# 5. PHÂN TÍCH SÂU VĂN BẢN BẰNG GEMINI 2.5
+# 5. AI PHÂN TÍCH CHUYÊN SÂU BẰNG GEMINI 2.5
 # ==========================================
 async def analyze_document_with_gemini(title: str, full_pdf_text: str) -> Dict[str, str]:
-    """Sử dụng Gemini 2.5 Flash phân tích sâu nội dung PDF."""
+    """Phân tích nội dung PDF để phân công đúng BGH và trích xuất thời hạn, yêu cầu."""
     default_res = {
         "chi_dao": "Hiệu trưởng Hoàng Anh Chung",
         "thuc_hien": "Các bộ phận liên quan",
         "han_chot": "Theo quy định",
-        "ket_qua": "Kế hoạch / Báo cáo thực hiện"
+        "ket_qua": "Kế hoạch / Báo cáo"
     }
 
     if not GEMINI_API_KEY:
         return default_res
 
-    # Cắt ngắn nội dung nếu quá dài (chỉ lấy 3000 ký tự đầu tiên chứa đầy đủ thông tin nhất)
-    clean_pdf_text = full_pdf_text[:3000] if full_pdf_text else "Không lấy được nội dung file đính kèm, phân tích dựa trên trích yếu."
+    clean_text = full_pdf_text[:3500] if full_pdf_text else "Không lấy được nội dung PDF, phân tích theo trích yếu."
 
     prompt = f"""
     Bạn là Thư ký Ban Giám hiệu Trường THPT Mai Sơn.
-    Hãy phân tích kỹ văn bản/file PDF sau để lập bảng phân công công việc chi tiết:
-    
-    📌 **Trích yếu**: "{title}"
+    Hãy đọc kỹ văn bản/PDF dưới đây để điền vào bảng tổng hợp phân công công việc:
+
+    📌 **Trích yếu văn bản**: "{title}"
     📄 **Nội dung chi tiết/PDF**:
-    "{clean_pdf_text}"
+    "{clean_text}"
 
-    --- QUY TẮC PHÂN CÔNG BGH THPT MAI SƠN ---
-    1. **Hiệu trưởng Hoàng Anh Chung**: Chỉ đạo chung, công tác Đảng, tổ chức cán bộ, tài chính, quy hoạch đất đai/CSVC lớn, các văn bản chỉ đạo trực tiếp từ Sở/Tỉnh.
-    2. **PHT Lại Thế Dũng**: Chuyên môn, giáo viên/học sinh, các cuộc thi HSG/GVG, tập huấn GDPT 2018, CNTT, chuyển đổi số.
-    3. **PHT CSVC/Lao động**: Quản lý tài sản, cơ sở vật chất, lao động, an ninh trật tự, PCCC, phòng chống tệ nạn/ma túy.
+    ================ Cơ CẤU PHÂN CÔNG BGH THPT MAI SƠN ================
+    1. **Hiệu trưởng Hoàng Anh Chung**: 
+       - Chỉ đạo chung, công tác Đảng, tổ chức cán bộ, tài chính, quy hoạch đất đai, nhà đất, tài sản công.
+       - Các văn bản quy phạm pháp luật, chỉ đạo trực tiếp từ Tỉnh ủy/Sở GD&ĐT mang tính chiến lược.
+    2. **Phó Hiệu trưởng Lại Thế Dũng**:
+       - Công tác chuyên môn dạy và học, hội thi HSG/GVG, tập huấn chương trình GDPT 2018.
+       - Chuyển đổi số, CNTT, thi cử, kiểm tra đánh giá, hoạt động thanh niên/tiếng hát/văn nghệ học sinh.
+    3. **Phó Hiệu trưởng CSVC & Lao động**:
+       - Cơ sở vật chất, sửa chữa trang thiết bị, vệ sinh môi trường, lao động, PCCC, an ninh trật tự trường học, y tế.
 
-    --- YÊU CẦU TRẢ VỀ ---
-    Hãy đọc kỹ các mốc thời gian, bộ phận được giao trong nội dung PDF và trả về duy nhất 4 dòng theo đúng định dạng sau:
-    CHỈ ĐẠO: <Ghi rõ Hiệu trưởng hoặc PHT Lại Thế Dũng hoặc PHT CSVC>
-    THỰC HIỆN: <Tên cụ thể các Tổ chuyên môn / Đoàn TN / Kế toán / Văn thư / GVCN...>
-    HẠN CHÓT: <Ngày/tháng/năm cụ thể ghi trong văn bản, nếu không ghi thì trả về 'Theo quy định'>
-    KẾT QUẢ: <Sản phẩm cụ thể cần nộp: Báo cáo / Kế hoạch / Danh sách / Biên bản /...>
+    ================ YÊU CẦU TRÍCH XUẤT ================
+    - **CHỈ ĐẠO**: Chọn chính xác 1 trong 3: "Hiệu trưởng Hoàng Anh Chung", "PHT Lại Thế Dũng", hoặc "PHT CSVC & Lao động".
+    - **THỰC HIỆN**: Tìm chính xác tên Tổ chuyên môn (Tổ Toán, Tổ Ngữ Văn...), Đoàn TN, Kế toán, Quản trị thiết bị, GVCN...
+    - **HẠN CHÓT**: Tìm ngày/tháng/năm cụ thể chót phải nộp/hoàn thành trong PDF (ví dụ: '25/08/2026' hoặc 'Trước 17h ngày 30/08/2026'). Nếu trong PDF không ghi ngày thì trả về 'Theo quy định'.
+    - **KẾT QUẢ**: Sản phẩm cụ thể cần nộp/thực hiện (Báo cáo thống kê, Kế hoạch tổ chức, Bảng rà soát, Danh sách cử dự thi...).
+
+    TRẢ VỀ DUY NHẤT 4 DÒNG THEO CÚ PHÁP:
+    CHỈ ĐẠO: <Ghi tên Lãnh đạo chỉ đạo>
+    THỰC HIỆN: <Ghi đơn vị/người thực hiện>
+    HẠN CHÓT: <Ghi thời hạn hoàn thành>
+    KẾT QUẢ: <Ghi sản phẩm/kết quả đầu ra>
     """
 
     try:
@@ -389,10 +386,10 @@ async def analyze_document_with_gemini(title: str, full_pdf_text: str) -> Dict[s
         return default_res
 
 # ==========================================
-# 6. KHI BẮT ĐẦU BOT VÀ WEB SERVER
+# 6. KHỞI CHẠY BOT
 # ==========================================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 **Xin chào BGH THPT Mai Sơn!**\n\nGõ lệnh **/scan** để Bot tự động cào danh sách iOffice, đọc file PDF đính kèm và xuất file Word báo cáo phân công.", parse_mode="Markdown")
+    await update.message.reply_text("👋 **Xin chào BGH THPT Mai Sơn!**\n\nGõ lệnh **/scan** để Bot cào toàn bộ danh sách văn bản iOffice, đọc file PDF và xuất file Word báo cáo phân công.", parse_mode="Markdown")
 
 async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await scan_and_process_ioffice(update, context)
@@ -405,14 +402,12 @@ async def main():
         logger.error("Thiếu TELEGRAM_BOT_TOKEN!")
         return
 
-    # Keep-alive Web Server cho Render
     app = web.Application()
     app.router.add_get('/', handle_ping)
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', PORT).start()
 
-    # Telegram Bot
     telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     telegram_app.add_handler(CommandHandler("start", start_command))
     telegram_app.add_handler(CommandHandler("scan", scan_command))
@@ -421,7 +416,7 @@ async def main():
     await telegram_app.start()
     await telegram_app.updater.start_polling(drop_pending_updates=True)
     
-    logger.info("Bot iOffice đã sẵn sàng nhận lệnh!")
+    logger.info("Bot iOffice đã sẵn sàng!")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
