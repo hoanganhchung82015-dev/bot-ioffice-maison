@@ -85,59 +85,74 @@ def analyze_with_gemini(doc_title):
             "y_kien_chi_dao": "Giao PHT chủ trì nghiên cứu, xây dựng kế hoạch triển khai thực hiện đúng quy định."
         }
 
-# --- 3. QUÉT VĂN BẢN TỪ IOFFICE ---
+# --- 3. QUÉT VĂN BẢN TỪ IOFFICE (ĐÃ TỐI ƯU BẤM VÀO MỤC CHỜ DUYỆT) ---
 async def scan_ioffice_documents():
     tasks = []
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context()
+        browser = await p.chromium.launch(
+            headless=True,
+            args=['--no-sandbox', '--disable-setuid-sandbox']
+        )
+        context = await browser.new_context(viewport={'width': 1280, 'height': 800})
         page = await context.new_page()
 
         try:
-            logging.info("Đang đăng nhập VNPT iOffice THPT Mai Sơn...")
-            await page.goto(IOFFICE_URL, timeout=30000)
+            logging.info("Đang truy cập trang đăng nhập VNPT iOffice...")
+            await page.goto(IOFFICE_URL, timeout=45000, wait_until="networkidle")
             
+            # 1. Đăng nhập
             if await page.query_selector("input[name='username']"):
                 await page.fill("input[name='username']", USERNAME)
                 await page.fill("input[name='password']", PASSWORD)
                 await page.click("button[type='submit']")
                 await page.wait_for_load_state("networkidle")
 
-            logging.info("Đang truy cập danh sách văn bản chờ xử lý...")
-            await page.goto(f"{IOFFICE_URL}/main/van-ban-den/cho-xu-ly", timeout=30000)
-            
-            try:
-                await page.wait_for_selector("table tbody tr", timeout=5000)
-            except Exception:
-                await browser.close()
-                return None, "📭 *Hiện tại không có văn bản mới nào cần xử lý!*"
+            logging.info("Đã đăng nhập thành công, đang điều hướng tới mục Chờ duyệt...")
 
-            rows = await page.query_selector_all("table tbody tr")
+            # 2. Bấm trực tiếp vào Icon / Thẻ "Chờ duyệt" trên giao diện
+            cho_duyet_selector = "text='Chờ duyệt'"
+            await page.wait_for_selector(cho_duyet_selector, timeout=15000)
+            await page.click(cho_duyet_selector)
+            await page.wait_for_timeout(3000) # Đợi danh sách load
+
+            # 3. Kiểm tra xem dữ liệu nằm trong iframe hay trang chính
+            frame = page
+            for f in page.frames:
+                if "van-ban" in f.url or "list" in f.url:
+                    frame = f
+                    break
+
+            # 4. Tìm các hàng trong bảng danh sách văn bản
+            await frame.wait_for_selector("table tbody tr", timeout=10000)
+            rows = await frame.query_selector_all("table tbody tr")
             
             if not rows or len(rows) == 0:
                 await browser.close()
-                return None, "📭 *Hiện tại không có văn bản mới nào cần xử lý!*"
-
-            first_row_text = await rows[0].inner_text()
-            if "không có" in first_row_text.lower() or "no data" in first_row_text.lower():
-                await browser.close()
-                return None, "📭 *Hiện tại không có văn bản mới nào cần xử lý!*"
+                return None, "📭 *Không tìm thấy văn bản nào trong mục Chờ duyệt!*"
 
             report = "📩 *BÁO CÁO DỰ THẢO PHÂN CÔNG VĂN BẢN (THPT MAI SƠN)*\n\n"
             count = 0
 
-            for row in rows[:5]:
-                count += 1
-                title_elem = await row.query_selector(".doc-title, a")
-                link_elem = await row.query_selector("a")
+            for row in rows[:5]: # Lấy tối đa 5 văn bản mới nhất
+                title_elem = await row.query_selector("a, .doc-title, td:nth-child(2)")
+                if not title_elem:
+                    continue
 
-                title = await title_elem.inner_text() if title_elem else "Văn bản đến"
+                title = await title_elem.inner_text()
+                title = title.strip().replace("\n", " ")
+                
+                if len(title) < 5 or "không có dữ liệu" in title.lower():
+                    continue
+
+                count += 1
+                link_elem = await row.query_selector("a")
                 doc_url = await link_elem.get_attribute("href") if link_elem else IOFFICE_URL
 
-                if not doc_url.startswith("http"):
+                if doc_url and not doc_url.startswith("http"):
                     doc_url = IOFFICE_URL + doc_url
 
+                # Gọi Gemini phân tích
                 analysis = analyze_with_gemini(title)
                 
                 task_info = {
@@ -148,7 +163,7 @@ async def scan_ioffice_documents():
                 }
                 tasks.append(task_info)
 
-                report += f"*{count}. {title[:60]}...*\n"
+                report += f"*{count}. {title[:70]}...*\n"
                 report += f"👤 *Chủ trì:* `{analysis['nguoi_chu_tri']}`\n"
                 report += f"📌 *Phối hợp:* {analysis['bo_phan_phoi_hop']}\n"
                 report += f"🎯 *Sản phẩm:* {analysis['san_pham_dau_ra']}\n"
@@ -157,12 +172,16 @@ async def scan_ioffice_documents():
                 report += "───────────────────\n"
 
             await browser.close()
+            
+            if count == 0:
+                return None, "📭 *Không quét được văn bản hợp lệ nào.*"
+                
             return tasks, report
 
         except Exception as e:
             await browser.close()
             logging.error(f"Lỗi truy cập iOffice: {e}")
-            return None, f"⚠️ *Không thể kết nối iOffice hoặc lỗi đăng nhập:* {str(e)}"
+            return None, f"⚠️ *Lỗi quét iOffice:* {str(e)}"
 
 # --- 4. TỰ ĐỘNG DÁN CHỈ ĐẠO LÊN IOFFICE ---
 async def apply_to_ioffice(tasks):
