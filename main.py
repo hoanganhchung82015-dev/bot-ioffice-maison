@@ -3,17 +3,16 @@ import asyncio
 import json
 import logging
 import threading
-import time
 from flask import Flask
 from playwright.async_api import async_playwright
-import google.generativeai as genai
+from google import genai
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # Cấu hình logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- 0. KHỞI TẠO FLASK SERVER CHO GUNICORN/RENDER ---
+# --- 0. KHỞI TẠO FLASK SERVER CHO RENDER HEALTH CHECK ---
 app = Flask(__name__)
 
 @app.route('/')
@@ -21,16 +20,20 @@ app = Flask(__name__)
 def health_check():
     return "Bot iOffice THPT Mai Son is running alive!", 200
 
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    # Chạy Flask ở luồng phụ, tắt reloader để không xung đột
+    app.run(host='0.0.0.0', port=port, use_reloader=False)
+
 # --- 1. BIẾN MÔI TRƯỜNG ---
 IOFFICE_URL = os.environ.get("IOFFICE_URL", "https://thptmaison.vnptioffice.vn")
 USERNAME = os.environ.get("IOFFICE_USERNAME")
 PASSWORD = os.environ.get("IOFFICE_PASSWORD")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.environ.get("HIUTRUONG_CHAT_ID")
 
-if GEMINI_KEY:
-    genai.configure(api_key=GEMINI_KEY)
+# Khởi tạo Gemini Client mới
+ai_client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
 
 # --- 2. PHÂN TÍCH VĂN BẢN BẰNG GEMINI 1.5 FLASH ---
 def analyze_with_gemini(doc_title):
@@ -53,8 +56,13 @@ def analyze_with_gemini(doc_title):
     }}
     """
     try:
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        response = model.generate_content(prompt)
+        if not ai_client:
+            raise Exception("Chưa cấu hình GEMINI_API_KEY")
+            
+        response = ai_client.models.generate_content(
+            model='gemini-1.5-flash',
+            contents=prompt,
+        )
         
         raw_text = response.text.strip()
         backticks = "\x60\x60\x60"
@@ -271,37 +279,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['pending_tasks'] = []
         await query.edit_message_text("❌ *Đã hủy lệnh tự động.*")
 
-# --- 6. KHỞI CHẠY BOT TRONG LUỒNG TRÃN HOÃN (DELAYED BACKGROUND THREAD) ---
-bot_started = False
+# --- 6. KHỞI CHẠY MAIN ---
+if __name__ == "__main__":
+    # 1. Chạy Flask ở luồng ngầm (Background Thread)
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logging.info("Flask server đã chạy ngầm để phục vụ Health Check Render.")
 
-def start_bot_delay():
-    global bot_started
-    if bot_started:
-        return
-    bot_started = True
-    
-    # Nghỉ 3 giây để Gunicorn kịp hoàn tất bind PORT
-    time.sleep(3)
-    
+    # 2. Chạy Telegram Bot ở Luồng chính (Main Thread)
     if not BOT_TOKEN:
         logging.error("Chưa cấu hình TELEGRAM_BOT_TOKEN!")
-        return
-
-    logging.info("Đang khởi tạo luồng Telegram Bot...")
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    application = Application.builder().token(BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("scan", scan_command))
-    application.add_handler(CallbackQueryHandler(handle_callback))
-
-    logging.info("Bot Telegram đã sẵn sàng nhận lệnh!")
-    application.run_polling(drop_pending_updates=True)
-
-# Tự động khởi chạy luồng Bot sau khi Gunicorn load thành công
-threading.Thread(target=start_bot_delay, daemon=True).start()
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+    else:
+        logging.info("Đang khởi động Telegram Bot ở luồng chính...")
+        application = Application.builder().token(BOT_TOKEN).build()
+        application.add_handler(CommandHandler("start", start_command))
+        application.add_handler(CommandHandler("scan", scan_command))
+        application.add_handler(CallbackQueryHandler(handle_callback))
+        
+        # Hàm run_polling chạy ở Main Thread sẽ đăng ký Signal thành công không còn lỗi
+        application.run_polling(drop_pending_updates=True)
