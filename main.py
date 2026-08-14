@@ -2,7 +2,8 @@ import os
 import asyncio
 import json
 import logging
-import requests
+import threading
+from flask import Flask
 from playwright.async_api import async_playwright
 import google.generativeai as genai
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -10,6 +11,20 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 
 # Cấu hình logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# --- 0. TẠO FLASK WEB SERVER ĐỂ GIỮ RENDER HEALTH CHECK ACTIVE ---
+web_app = Flask(__name__)
+
+@web_app.route('/')
+@web_app.route('/health')
+def health_check():
+    return "Bot iOffice THPT Mai Son is running successfully!", 200
+
+def run_flask():
+    # Render tự động gán cổng qua biến môi trường PORT (mặc định 10000)
+    port = int(os.environ.get("PORT", 10000))
+    logging.info(f"Đang khởi chạy Flask Web Server tại port {port}...")
+    web_app.run(host='0.0.0.0', port=port)
 
 # --- 1. BIẾN MÔI TRƯỜNG ---
 IOFFICE_URL = os.environ.get("IOFFICE_URL", "https://thptmaison.vnptioffice.vn")
@@ -19,7 +34,6 @@ GEMINI_KEY = os.environ.get("GEMINI_API_KEY")
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("HIUTRUONG_CHAT_ID")
 
-# Cấu hình Gemini API
 if GEMINI_KEY:
     genai.configure(api_key=GEMINI_KEY)
 
@@ -47,9 +61,8 @@ def analyze_with_gemini(doc_title):
         model = genai.GenerativeModel('gemini-1.5-flash')
         response = model.generate_content(prompt)
         
-        # Bóc tách JSON cực kỳ an toàn, dùng mã hóa ASCII tránh lỗi rớt dòng
         raw_text = response.text.strip()
-        backticks = "\x60\x60\x60"  # Mã hóa dấu 3 backticks
+        backticks = "\x60\x60\x60"
         
         if backticks in raw_text:
             parts = raw_text.split(backticks)
@@ -82,7 +95,6 @@ async def scan_ioffice_documents():
             logging.info("Đang đăng nhập VNPT iOffice THPT Mai Sơn...")
             await page.goto(IOFFICE_URL, timeout=30000)
             
-            # Tự động điền tài khoản nếu có ô đăng nhập
             if await page.query_selector("input[name='username']"):
                 await page.fill("input[name='username']", USERNAME)
                 await page.fill("input[name='password']", PASSWORD)
@@ -170,24 +182,20 @@ async def apply_to_ioffice(tasks):
                 try:
                     await page.goto(item['doc_url'], timeout=30000)
                     
-                    # Nút Chuyển xử lý
                     btn_chuyen = await page.query_selector(".btn-chuyen-xu-ly, button:has-text('Chuyển'), a:has-text('Chuyển')")
                     if btn_chuyen:
                         await btn_chuyen.click()
                         await page.wait_for_timeout(1000)
 
-                    # Điền ý kiến chỉ đạo
                     textarea = await page.query_selector("textarea[name='y_kien_chi_dao'], textarea")
                     if textarea:
                         await textarea.fill(item['y_kien_chi_dao'])
 
-                    # Chọn người nhận (Tìm ô tích có chữ Dũng)
                     if "Dũng" in item['nguoi_chu_tri']:
                         chk_dung = await page.query_selector("label:has-text('Dũng') input, tr:has-text('Dũng') input[type='checkbox']")
                         if chk_dung:
                             await chk_dung.check()
 
-                    # Bấm nút Gửi/Chuyển
                     btn_send = await page.query_selector("button#btn-send, button:has-text('Gửi'), button:has-text('Chuyển')")
                     if btn_send:
                         await btn_send.click()
@@ -226,7 +234,6 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text(report, parse_mode="Markdown")
             return
 
-        # Lưu danh sách công việc vào user_data của phiên chat hiện tại
         context.user_data['pending_tasks'] = tasks
 
         keyboard = [
@@ -256,7 +263,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         success, err = await apply_to_ioffice(tasks)
         if success:
-            # Xóa cache sau khi hoàn tất
             context.user_data['pending_tasks'] = []
             await context.bot.send_message(
                 chat_id=query.message.chat_id,
@@ -274,12 +280,16 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['pending_tasks'] = []
         await query.edit_message_text("❌ *Đã hủy lệnh tự động.* Thầy có thể phân công trực tiếp trên web iOffice.")
 
-# --- 6. CHẠY WEB SERVICE LÂU DÀI ---
+# --- 6. KHỞI CHẠY KHÓA SONG SONG (FLASK + TELEGRAM BOT) ---
 def main():
     if not BOT_TOKEN:
         logging.error("Chưa cấu hình TELEGRAM_BOT_TOKEN!")
         return
 
+    # Chạy Flask ở luồng riêng để trả lời yêu cầu Port từ Render
+    threading.Thread(target=run_flask, daemon=True).start()
+
+    # Chạy Bot Telegram ở luồng chính
     application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start_command))
