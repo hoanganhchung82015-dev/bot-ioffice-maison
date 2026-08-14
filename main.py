@@ -12,7 +12,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 # Cấu hình logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- 0. KHỞI TẠO FLASK SERVER PHỤC VỤ RENDER HEALTH CHECK ---
+# --- 0. KHỞI TẠO FLASK SERVER CHO RENDER HEALTH CHECK ---
 app = Flask(__name__)
 
 @app.route('/')
@@ -57,7 +57,7 @@ def analyze_with_gemini(doc_title):
     """
     try:
         if not ai_client:
-            raise Exception("Chưa cấu hình GEMINI_API_KEY")
+            raise Exception("Chưa cấu hình GEMINI_API_KEY trong Environment Variables")
             
         response = ai_client.models.generate_content(
             model='gemini-1.5-flash',
@@ -85,63 +85,85 @@ def analyze_with_gemini(doc_title):
             "y_kien_chi_dao": "Giao PHT chủ trì nghiên cứu, xây dựng kế hoạch triển khai thực hiện đúng quy định."
         }
 
-# --- 3. QUÉT VĂN BẢN TỪ IOFFICE (ĐÃ TỐI ƯU BẤM VÀO MỤC CHỜ DUYỆT) ---
+# --- 3. QUÉT VĂN BẢN TỪ IOFFICE (TỐI ƯU VÀO MỤC CHỜ DUYỆT) ---
 async def scan_ioffice_documents():
     tasks = []
 
     async with async_playwright() as p:
+        # Cấu hình Chrome tối ưu tốc độ cho Server
         browser = await p.chromium.launch(
             headless=True,
-            args=['--no-sandbox', '--disable-setuid-sandbox']
+            args=[
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--disable-gpu',
+                '--no-first-run',
+                '--no-zygote'
+            ]
         )
         context = await browser.new_context(viewport={'width': 1280, 'height': 800})
         page = await context.new_page()
 
+        # Tắt nạp ảnh, CSS không cần thiết để tăng tốc
+        await page.route("**/*.{png,jpg,jpeg,svg,gif,woff,woff2}", lambda route: route.abort())
+
         try:
-            logging.info("Đang truy cập trang đăng nhập VNPT iOffice...")
-            await page.goto(IOFFICE_URL, timeout=45000, wait_until="networkidle")
+            logging.info("Đang đăng nhập VNPT iOffice THPT Mai Sơn...")
+            await page.goto(IOFFICE_URL, timeout=30000, wait_until="domcontentloaded")
             
-            # 1. Đăng nhập
+            # Đăng nhập
             if await page.query_selector("input[name='username']"):
                 await page.fill("input[name='username']", USERNAME)
                 await page.fill("input[name='password']", PASSWORD)
                 await page.click("button[type='submit']")
-                await page.wait_for_load_state("networkidle")
+                await page.wait_for_load_state("domcontentloaded")
 
-            logging.info("Đã đăng nhập thành công, đang điều hướng tới mục Chờ duyệt...")
+            logging.info("Đã đăng nhập thành công. Đang tìm và bấm vào ô Chờ duyệt...")
 
-            # 2. Bấm trực tiếp vào Icon / Thẻ "Chờ duyệt" trên giao diện
+            # Tìm và click mục "Chờ duyệt"
             cho_duyet_selector = "text='Chờ duyệt'"
-            await page.wait_for_selector(cho_duyet_selector, timeout=15000)
-            await page.click(cho_duyet_selector)
-            await page.wait_for_timeout(3000) # Đợi danh sách load
+            try:
+                await page.wait_for_selector(cho_duyet_selector, timeout=10000)
+                await page.click(cho_duyet_selector)
+            except Exception:
+                # Nếu không bấm được text, thử đường dẫn trực tiếp
+                await page.goto(f"{IOFFICE_URL}/main/van-ban-den/cho-duyet", timeout=15000)
 
-            # 3. Kiểm tra xem dữ liệu nằm trong iframe hay trang chính
-            frame = page
+            await page.wait_for_timeout(2000) # Đợi dữ liệu load
+
+            # Kiểm tra nếu bảng dữ liệu nằm trong iframe
+            target_frame = page
             for f in page.frames:
-                if "van-ban" in f.url or "list" in f.url:
-                    frame = f
+                if "van-ban" in f.url or "list" in f.url or "cho-duyet" in f.url:
+                    target_frame = f
                     break
 
-            # 4. Tìm các hàng trong bảng danh sách văn bản
-            await frame.wait_for_selector("table tbody tr", timeout=10000)
-            rows = await frame.query_selector_all("table tbody tr")
+            # Lấy danh sách hàng trong bảng
+            try:
+                await target_frame.wait_for_selector("table tbody tr", timeout=8000)
+            except Exception:
+                await browser.close()
+                return None, "📭 *Hiện tại không có văn bản nào trong mục Chờ duyệt!*"
+
+            rows = await target_frame.query_selector_all("table tbody tr")
             
             if not rows or len(rows) == 0:
                 await browser.close()
-                return None, "📭 *Không tìm thấy văn bản nào trong mục Chờ duyệt!*"
+                return None, "📭 *Hiện tại không có văn bản nào trong mục Chờ duyệt!*"
 
             report = "📩 *BÁO CÁO DỰ THẢO PHÂN CÔNG VĂN BẢN (THPT MAI SƠN)*\n\n"
             count = 0
 
-            for row in rows[:5]: # Lấy tối đa 5 văn bản mới nhất
+            for row in rows[:5]: # Quét tối đa 5 văn bản mới nhất
                 title_elem = await row.query_selector("a, .doc-title, td:nth-child(2)")
                 if not title_elem:
                     continue
 
                 title = await title_elem.inner_text()
                 title = title.strip().replace("\n", " ")
-                
+
                 if len(title) < 5 or "không có dữ liệu" in title.lower():
                     continue
 
@@ -172,16 +194,16 @@ async def scan_ioffice_documents():
                 report += "───────────────────\n"
 
             await browser.close()
-            
+
             if count == 0:
-                return None, "📭 *Không quét được văn bản hợp lệ nào.*"
-                
+                return None, "📭 *Không quét được văn bản hợp lệ nào trong mục Chờ duyệt.*"
+
             return tasks, report
 
         except Exception as e:
             await browser.close()
             logging.error(f"Lỗi truy cập iOffice: {e}")
-            return None, f"⚠️ *Lỗi quét iOffice:* {str(e)}"
+            return None, f"⚠️ *Không thể quét iOffice:* {str(e)}"
 
 # --- 4. TỰ ĐỘNG DÁN CHỈ ĐẠO LÊN IOFFICE ---
 async def apply_to_ioffice(tasks):
@@ -189,7 +211,10 @@ async def apply_to_ioffice(tasks):
         return False, "Không có dữ liệu văn bản để dán."
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(
+            headless=True,
+            args=['--no-sandbox', '--disable-setuid-sandbox']
+        )
         page = await browser.new_page()
 
         try:
@@ -198,7 +223,7 @@ async def apply_to_ioffice(tasks):
                 await page.fill("input[name='username']", USERNAME)
                 await page.fill("input[name='password']", PASSWORD)
                 await page.click("button[type='submit']")
-                await page.wait_for_load_state("networkidle")
+                await page.wait_for_load_state("domcontentloaded")
 
             for item in tasks:
                 try:
@@ -237,17 +262,18 @@ async def apply_to_ioffice(tasks):
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     await update.message.reply_text(
-        f"👋 *Chào mừng Thầy/Cô đến với Bot Trợ lý iOffice THPT Mai Sơn!*\n\n"
-        f"🆔 Chat ID Telegram của bạn là: `{user_id}`\n\n"
-        f"Gõ lệnh /scan để bắt đầu kiểm tra và lập dự thảo phân công văn bản iOffice.",
+        f"👋 *Chào mừng Thầy đến với Bot Trợ lý iOffice THPT Mai Sơn!*\n\n"
+        f"🆔 Chat ID Telegram của bạn: `{user_id}`\n\n"
+        f"Gõ lệnh /scan để bắt đầu quét mục Chờ duyệt và lập dự thảo phân công văn bản.",
         parse_mode="Markdown"
     )
 
 async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("⏳ Đang kết nối iOffice THPT Mai Sơn và gọi Gemini phân tích văn bản...")
+    msg = await update.message.reply_text("⏳ *Đang đăng nhập iOffice THPT Mai Sơn và mở mục Chờ duyệt...*", parse_mode="Markdown")
     
     try:
-        tasks, report = await asyncio.wait_for(scan_ioffice_documents(), timeout=25.0)
+        # Thời gian chờ tối đa 60 giây
+        tasks, report = await asyncio.wait_for(scan_ioffice_documents(), timeout=60.0)
 
         if not tasks:
             await msg.edit_text(report, parse_mode="Markdown")
@@ -263,9 +289,10 @@ async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(report, parse_mode="Markdown", reply_markup=reply_markup)
 
     except asyncio.TimeoutError:
-        await msg.edit_text("⚠️ *Quá thời gian kết nối (Timeout)!* Hệ thống iOffice phản hồi quá chậm.", parse_mode="Markdown")
+        await msg.edit_text("⚠️ *Quá thời gian chờ (Timeout 60s)!* Mạng iOffice phản hồi chậm hoặc đang treo.", parse_mode="Markdown")
     except Exception as e:
-        await msg.edit_text(f"⚠️ *Lỗi phát sinh:* {str(e)}", parse_mode="Markdown")
+        logging.error(f"Lỗi trong scan_command: {e}")
+        await msg.edit_text(f"⚠️ *Lỗi phát sinh:* `{str(e)}`", parse_mode="Markdown")
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -277,7 +304,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("⚠️ *Dữ liệu đã hết hạn.* Hãy gõ /scan để lấy danh sách mới.", parse_mode="Markdown")
             return
 
-        await query.edit_message_text("⏳ *Đang tự động dán chỉ đạo lên iOffice...*", parse_mode="Markdown")
+        await query.edit_message_text("⏳ *Đang tự động dán ý kiến chỉ đạo lên iOffice...*", parse_mode="Markdown")
         
         success, err = await apply_to_ioffice(tasks)
         if success:
@@ -300,14 +327,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- 6. KHỞI CHẠY MAIN ---
 if __name__ == "__main__":
-    # 1. Chạy Flask ở Luồng phụ (Background Thread) để xử lý Health Check của Render
+    # 1. Chạy Flask ở Luồng phụ (Background Thread)
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
-    logging.info("Flask server đã khởi động ngầm thành công.")
+    logging.info("Flask server đã chạy ngầm để giữ Render Health Check.")
 
     # 2. Chạy Telegram Bot ở Luồng chính (Main Thread)
     if not BOT_TOKEN:
-        logging.error("Chưa cấu hình TELEGRAM_BOT_TOKEN trong biến môi trường!")
+        logging.error("Chưa cấu hình TELEGRAM_BOT_TOKEN!")
     else:
         logging.info("Đang khởi động Telegram Bot ở Luồng chính...")
         application = Application.builder().token(BOT_TOKEN).build()
@@ -315,5 +342,5 @@ if __name__ == "__main__":
         application.add_handler(CommandHandler("scan", scan_command))
         application.add_handler(CallbackQueryHandler(handle_callback))
         
-        # Chạy Polling ở Luồng chính
+        # Chạy Polling
         application.run_polling(drop_pending_updates=True)
