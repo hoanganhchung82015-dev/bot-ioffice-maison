@@ -34,7 +34,7 @@ def analyze_with_gemini(doc_title):
     - PHT CSVC: Cơ sở vật chất, lao động, an ninh trật tự, PCCC, phòng chống ma túy, các phong trào/ngoại khóa.
     - Hiệu trưởng: Công tác Đảng, tài chính, tổ chức cán bộ, các quy định pháp luật/chỉ đạo chung.
 
-    Hãy trả về đúng định dạng JSON (không dùng khối markdown ```json):
+    Hãy trả về đúng định dạng JSON:
     {{
         "nguoi_chu_tri": "PHT Lại Thế Dũng" hoặc "PHT CSVC" hoặc "Hiệu trưởng",
         "bo_phan_phoi_hop": "Tổ chuyên môn / Đoàn TN / Kế toán / Bảo vệ...",
@@ -46,4 +46,8 @@ def analyze_with_gemini(doc_title):
     try:
         model = genai.GenerativeModel('gemini-1.5-flash')
         response = model.generate_content(prompt)
-        clean_json = response.text.replace("
+        
+        # Bóc tách khối JSON an toàn, tránh lỗi rớt dòng/chuỗi
+        text = response.text.strip()
+        if "```" in text:
+            parts = text.split("
