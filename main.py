@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import threading
+import time
 from flask import Flask
 from playwright.async_api import async_playwright
 import google.generativeai as genai
@@ -270,13 +271,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['pending_tasks'] = []
         await query.edit_message_text("❌ *Đã hủy lệnh tự động.*")
 
-# --- 6. KHỞI CHẠY BOT TRONG LUỒNG PHỤ (BACKGROUND THREAD) ---
-def run_telegram_bot():
+# --- 6. KHỞI CHẠY BOT TRONG LUỒNG TRÃN HOÃN (DELAYED BACKGROUND THREAD) ---
+bot_started = False
+
+def start_bot_delay():
+    global bot_started
+    if bot_started:
+        return
+    bot_started = True
+    
+    # Nghỉ 3 giây để Gunicorn kịp hoàn tất bind PORT
+    time.sleep(3)
+    
     if not BOT_TOKEN:
         logging.error("Chưa cấu hình TELEGRAM_BOT_TOKEN!")
         return
 
-    # Khởi tạo event loop riêng cho luồng Telegram Bot
+    logging.info("Đang khởi tạo luồng Telegram Bot...")
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
@@ -285,11 +296,11 @@ def run_telegram_bot():
     application.add_handler(CommandHandler("scan", scan_command))
     application.add_handler(CallbackQueryHandler(handle_callback))
 
-    logging.info("Bot Telegram đang bắt đầu Polling...")
+    logging.info("Bot Telegram đã sẵn sàng nhận lệnh!")
     application.run_polling(drop_pending_updates=True)
 
-# Bật luồng chạy Telegram Bot ngay khi file được import bởi Gunicorn
-threading.Thread(target=run_telegram_bot, daemon=True).start()
+# Tự động khởi chạy luồng Bot sau khi Gunicorn load thành công
+threading.Thread(target=start_bot_delay, daemon=True).start()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
